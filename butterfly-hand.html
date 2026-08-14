@@ -233,6 +233,9 @@ function analyzeHand(lm){
 const handPrev = {};                 // 记录每只手上一帧位置，用于判断挥手
 const WAVE_SPEED = 0.045;            // 归一化速度阈值（越小越灵敏）
 const SCARE_RADIUS = 300;            // 惊吓半径（像素）
+const handDwell = {};                // 每只手：连续满足(张开+基本静止)的帧数
+const STILL_SPEED = 0.03;            // 低于此归一化速度算“停稳”
+const DWELL_FRAMES = 30;             // 需保持张开且停稳约 1 秒才捕获蝴蝶
 
 // 让某只蝴蝶朝远离 (hx,hy) 的方向逃 dist 像素、持续 frames 帧
 function fleeFrom(b, hx, hy, dist, frames){
@@ -277,7 +280,7 @@ function onResults(res){
       if (c.lost > LOST_GRACE){ c.hand = null; c.onHand = false; c.lost = 0; }
     }
   }
-  for (const k in handPrev){ if (!present[k]) delete handPrev[k]; }
+  for (const k in handPrev){ if (!present[k]){ delete handPrev[k]; delete handDwell[k]; } }
 
   // 挥手检测：手移动过快 -> 手里的那只飞走、周围的略退开
   const waving = {};
@@ -289,14 +292,20 @@ function onResults(res){
       if (speed > WAVE_SPEED){
         waving[label] = true;
         const hpx = info.palmX * W, hpy = info.palmY * H - 8;
-        // 只有手里那只处于"张开"状态时，挥手才把它甩飞；
-        // 握拳（挤压绘画/擦除）时无论移动多快都不放手 —— 用滞回后的稳定状态，避开单帧噪声
+        // 手移动太快 -> 手里那只无论张开还是握拳都会被甩飞
         const held = all.find(x => x.hand === label);
-        if (held && held.handOpen){
+        if (held){
           held.hand = null; held.onHand = false; fleeFrom(held, hpx, hpy, 340, 75);
         }
         scareCreatures(hpx, hpy);   // 周围的自由生物只飞远一点点
       }
+      // 停稳计时：仅当手【空着】且张开、移动很慢时才累加 -> 每次捕获前都要重新停稳
+      // （手里已抓着生物时不累加，放走后再抓仍需重新静止一会儿）
+      const holdingNow = all.some(x => x.hand === label);
+      if (!holdingNow && info.open > 0.6 && speed < STILL_SPEED) handDwell[label] = (handDwell[label]||0) + 1;
+      else handDwell[label] = 0;
+    } else {
+      handDwell[label] = 0;   // 刚出现的手从 0 开始计时
     }
     handPrev[label] = { x: info.palmX, y: info.palmY };
   }
@@ -308,8 +317,8 @@ function onResults(res){
     const hy = info.palmY * H - 8;          // 略停在手掌上方
 
     let c = all.find(x => x.hand === label);
-    if (!c && !waving[label] && info.open > 0.5){
-      // 只有手张开且未在挥动时才抓新的（捏合/挥动时不换、不抓其他蝴蝶；已握住的继续跟随）
+    if (!c && !waving[label] && info.open > 0.5 && (handDwell[label]||0) >= DWELL_FRAMES){
+      // 手张开且停稳一会儿后才抓最近的（捏合/挥动/刚张开时不抓；已握住的继续跟随）
       let best = null, bd = Infinity;
       for (const x of all){
         if (x.hand) continue;
@@ -317,7 +326,7 @@ function onResults(res){
         if (d < bd){ bd = d; best = x; }
       }
       c = best;
-      if (c) c.hand = label;
+      if (c){ c.hand = label; handDwell[label] = 0; }   // 抓到后清零，下次捕获需重新停稳
     }
     if (c){
       c.onHand = true;
@@ -790,7 +799,7 @@ function spawnDust(x, y, t, strength, bsize){
       vy: (Math.random()-0.5)*0.035 - 0.012,
       ox: Math.cos(a), oy: Math.sin(a),             // 向外发散的方向
       life: 1, decay: 0.00045 + Math.random()*0.00045, // 更慢：约 22~37 秒后才消失
-      size: (1.5 + Math.random()*2.6) * f,              // 颗粒也随蝴蝶大小
+      size: (0.9 + Math.random()*1.5) * f,              // 颗粒直径调小；仍随蝴蝶大小
       h, s, l, ph: Math.random()*6.28, sw: 0.008 + Math.random()*0.018
     });
   }
