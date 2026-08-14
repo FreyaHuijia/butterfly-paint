@@ -1,0 +1,1029 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Butterfly on Hand · Gesture Controlled</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #0a0e1a; overflow: hidden; font-family: -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  /* mirror so the picture behaves like a mirror */
+  video { transform: scaleX(-1); filter: brightness(0.85) saturate(0.9); }
+  canvas { transform: scaleX(-1); }
+  /* name popup shown when a caught butterfly opens its wings */
+  #labels { position: fixed; inset: 0; pointer-events: none; z-index: 15; }
+  .label {
+    position: absolute; transform: translate(-50%, -100%) scale(0.9);
+    padding: 8px 14px 9px; border-radius: 14px; white-space: nowrap;
+    background: rgba(15,20,35,0.82); backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,0.14); box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    opacity: 0; transition: opacity .25s ease, transform .25s ease;
+  }
+  .label.show { opacity: 1; transform: translate(-50%, -100%) scale(1); }
+  .label .nm { color: #fff; font-size: 15px; font-weight: 700; letter-spacing: .3px; }
+  .label .sci { color: #9aa5c4; font-size: 11px; font-style: italic; margin-top: 1px; }
+  .label::after {   /* little pointer */
+    content: ''; position: absolute; left: 50%; bottom: -6px; transform: translateX(-50%);
+    border: 6px solid transparent; border-top-color: rgba(15,20,35,0.82); border-bottom: 0;
+  }
+  #hud {
+    position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+    color: #cdd6f4; background: rgba(15,20,35,0.55); backdrop-filter: blur(10px);
+    padding: 12px 22px; border-radius: 999px; font-size: 14px; letter-spacing: .5px;
+    border: 1px solid rgba(255,255,255,0.08); white-space: nowrap; z-index: 10;
+    transition: opacity .4s; text-align: center;
+  }
+  #hud b { color: #f9e2af; font-weight: 600; }
+  #start {
+    position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 26px;
+    background: radial-gradient(circle at 50% 40%, #16203a, #0a0e1a 70%); color: #cdd6f4;
+  }
+  #start h1 { font-size: 30px; font-weight: 600; letter-spacing: 1px; }
+  #start p { font-size: 15px; color: #9aa5c4; max-width: 340px; text-align: center; line-height: 1.7; }
+  #start button {
+    padding: 14px 44px; font-size: 17px; border: none; border-radius: 999px; cursor: pointer;
+    background: linear-gradient(135deg,#f9a8d4,#c4b5fd); color: #1a1030; font-weight: 700;
+    box-shadow: 0 10px 30px rgba(196,181,253,0.35); transition: transform .15s;
+  }
+  #start button:hover { transform: translateY(-2px); }
+  #start .emoji { font-size: 56px; animation: float 3s ease-in-out infinite; }
+  @keyframes float { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-14px)} }
+  #err { color:#f38ba8; font-size:13px; min-height:18px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+</div>
+
+<div id="labels"></div>
+
+<div id="hud">Catch a butterfly · <b>Open palm</b> shows its name · <b>Squeeze (fist)</b> to paint with pollen — the marks slowly fade</div>
+
+<div id="start">
+  <div class="emoji">🦋</div>
+  <h1>Butterfly on Hand</h1>
+  <p>Several different butterflies are fluttering on screen. Hold out a hand (either one) and the nearest one flies over to land on it.<br>Open your fingers and the wings spread; make a fist and they fold. Open your palm to see its name.<br>Two fireflies drift around nibbling your paintings — catch one and make a fist to erase.</p>
+  <button id="startBtn">Start Camera</button>
+  <div id="err"></div>
+</div>
+
+<!-- MediaPipe Hands (loaded from CDN, needs internet) -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+<script>
+const video  = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx    = canvas.getContext('2d');
+const hud    = document.getElementById('hud');
+const startScreen = document.getElementById('start');
+const startBtn = document.getElementById('startBtn');
+const errEl = document.getElementById('err');
+const labelsEl = document.getElementById('labels');
+
+let W = 0, H = 0;
+function resize(){ W = canvas.width = innerWidth; H = canvas.height = innerHeight; }
+addEventListener('resize', resize); resize();
+
+/* ---------- 蝴蝶种类（按真实颜色/花纹/翼展） ---------- */
+// 颜色用 [H,S,L]；span 为真实翼展(cm)，决定相对大小
+const TYPES = [
+  // Monarch: orange + black veins/border + double row of white spots, wingspan ~9.5cm
+  { name:'Monarch', sci:'Danaus plexippus', style:'monarch', span:9.5,
+    up:[30,88,52], deep:[26,88,42], edge:[26,55,10], spot:[38,60,92], under:[32,45,60] },
+  // Blue Morpho: metallic iridescent blue + black edge, largest ~15cm, brown underside
+  { name:'Blue Morpho', sci:'Morpho menelaus', style:'morpho', span:15,
+    up:[212,88,52], sheen:[200,95,70], edge:[220,40,8], under:[28,35,26] },
+  // Tiger Swallowtail: yellow + black tiger stripes + tails, wingspan ~11cm
+  { name:'Tiger Swallowtail', sci:'Papilio glaucus', style:'tiger', span:11,
+    up:[47,92,58], deep:[44,90,50], edge:[45,60,8], blue:[212,65,52], orange:[24,88,55], under:[46,45,64] },
+  // Peacock: wine-red + large eyespots, wingspan ~6.5cm
+  { name:'Peacock', sci:'Aglais io', style:'peacock', span:6.5,
+    up:[352,68,42], deep:[352,72,30], edge:[350,40,12], under:[20,15,14] },
+  // Red Admiral: black + red-orange bands + white spots, wingspan ~6cm
+  { name:'Red Admiral', sci:'Vanessa atalanta', style:'admiral', span:6,
+    up:[0,0,9], band:[8,88,48], spot:[0,0,100], under:[25,20,28] },
+  // Cabbage White: white wings + charcoal tips & spots, wingspan ~4cm (smallest)
+  { name:'Cabbage White', sci:'Pieris rapae', style:'cabbage', span:4,
+    up:[50,12,96], deep:[48,15,88], tip:[220,8,32], spot:[220,10,28], under:[52,25,82] },
+  // Emerald Swallowtail: black-green + bright emerald metallic bands + tails, ~9cm
+  { name:'Emerald Swallowtail', sci:'Papilio palinurus', style:'emerald', span:9,
+    up:[140,55,16], deep:[140,45,9], edge:[140,40,7], band:[135,85,50], core:[110,90,66],
+    spotA:[210,80,55], spotB:[30,90,55], under:[140,25,18] },
+  // Common Bluebottle: black wings + central turquoise translucent band, ~9cm
+  { name:'Common Bluebottle', sci:'Graphium sarpedon', style:'bluebottle', span:9,
+    up:[200,25,8], edge:[200,20,5], band:[175,82,55], core:[165,88,66], under:[195,18,22] },
+  // Purple Emperor: brown + iridescent purple sheen + white bands + orange ring, ~8cm
+  { name:'Purple Emperor', sci:'Apatura iris', style:'emperor', span:8,
+    up:[280,30,20], deep:[285,35,12], sheen:[270,65,46], edge:[285,25,8],
+    band:[0,0,96], ring:[28,85,55], under:[35,25,45] },
+  // Pink Cattleheart: silky black + bright pink spot rows + green forewing dots, ~8cm
+  { name:'Pink Cattleheart', sci:'Parides sp.', style:'cattleheart', span:8,
+    up:[330,15,7], deep:[330,20,5], edge:[330,10,5], pink:[330,85,70], green:[135,70,50], under:[335,30,18] },
+  // Black Swallowtail: black + rows of cream spots + blue band + orange eyespots + tails, ~8.5cm
+  { name:'Black Swallowtail', sci:'Papilio polyxenes', style:'blackswallow', span:8.5,
+    up:[40,12,11], deep:[0,0,4], edge:[0,0,3], spot:[46,45,86], blue:[212,78,56], orange:[30,92,55], under:[40,18,20] },
+];
+
+/* ---------- 蝴蝶群 ---------- */
+// 随机大小（与花色无关）；大小也决定它画出的笔画粗细
+const BFLY_SHRINK = 0.55;   // 整体把蝴蝶再调小
+function randomButterflySize(){ return (46 + Math.random()*92) * BFLY_SHRINK; }  // 约 25 ~ 76
+
+function makeButterfly(i){
+  return {
+    kind: 'butterfly',
+    type: TYPES[i % TYPES.length],
+    size: randomButterflySize(),
+    x: Math.random()*W, y: Math.random()*H,
+    vx: 0, vy: 0,
+    targetX: Math.random()*W, targetY: Math.random()*H,
+    openness: 1, targetOpen: 1,           // 0=合拢 1=张开
+    handOpen: true,                       // 手势判定：只有张开/合上两种
+    onHand: false,
+    hand: null,                           // 被哪只手（'Left'/'Right'）抓住
+    fleeT: 0, fleeX: 0, fleeY: 0,         // 受惊逃离：剩余帧数 + 逃跑目标
+    entering: false,                      // 刚从边缘飞入（进入画面前不做离场检测）
+    wanderT: Math.random()*100,
+    flap: Math.random()*6,                // 扇翅相位
+    // 各自独立的漫游轨迹（Lissajous），让它们分散乱飞
+    wsx: 0.15 + Math.random()*0.22,
+    wsy: 0.15 + Math.random()*0.22,
+    phx: Math.random()*6.28,
+    phy: Math.random()*6.28,
+    ampx: 0.26 + Math.random()*0.16,
+    ampy: 0.26 + Math.random()*0.16,
+  };
+}
+const butterflies = Array.from({length: TYPES.length}, (_, i) => makeButterfly(i));
+
+// 随机游走：接近目标就换一个随机方向的新目标（只是乱飞，不刻意飞出）
+function newRoamTarget(b){
+  const step = 0.24;   // 步长（占屏幕比例）
+  b.targetX = b.x + (Math.random()-0.5) * 2 * step * W;
+  b.targetY = b.y + (Math.random()-0.5) * 2 * step * H;
+}
+
+// 飞出画布后重生：同花色、新的随机大小，从随机边缘飞入（速度不变，不加速）
+function respawnButterfly(b){
+  b.size = randomButterflySize();
+  b.entering = true;
+  b.vx = 0; b.vy = 0;
+  const m = b.size + 40;
+  const edge = Math.floor(Math.random()*4);
+  if (edge === 0){ b.x = -m;    b.y = Math.random()*H; }
+  else if (edge === 1){ b.x = W + m; b.y = Math.random()*H; }
+  else if (edge === 2){ b.x = Math.random()*W; b.y = -m; }
+  else { b.x = Math.random()*W; b.y = H + m; }
+  b.targetX = W * (0.25 + Math.random()*0.5);   // 目标在画面内 -> 飞进来
+  b.targetY = H * (0.25 + Math.random()*0.5);
+}
+
+/* ---------- 萤火虫（会吃掉画作；被抓住后可当橡皮擦） ---------- */
+function makeFirefly(){
+  return {
+    kind: 'firefly',
+    x: Math.random()*W, y: Math.random()*H, vx: 0, vy: 0,
+    targetX: Math.random()*W, targetY: Math.random()*H,
+    onHand: false, hand: null,
+    openness: 1, targetOpen: 1, handOpen: true,   // 复用同一套手势字段（张开/握拳）
+    fleeT: 0, fleeX: 0, fleeY: 0,
+    wanderT: Math.random()*100, phase: Math.random()*6.28,
+    size: 13 + Math.random()*4,
+    wsx: 0.20 + Math.random()*0.25, wsy: 0.20 + Math.random()*0.25,
+    phx: Math.random()*6.28, phy: Math.random()*6.28,
+    ampx: 0.30 + Math.random()*0.15, ampy: 0.30 + Math.random()*0.15,
+  };
+}
+const fireflies = Array.from({length: 2}, makeFirefly);
+
+/* ---------- 手势解析 ---------- */
+// 返回 {palmX, palmY, open} —— open 为 0~1 的手掌张开程度
+function analyzeHand(lm){
+  // 关键点索引：0腕 5/9/13/17 指根 8/12/16/20 指尖 4拇指尖
+  const palmX = (lm[0].x + lm[5].x + lm[9].x + lm[13].x + lm[17].x) / 5;
+  const palmY = (lm[0].y + lm[5].y + lm[9].y + lm[13].y + lm[17].y) / 5;
+
+  // 用手掌宽度做归一化尺度（对远近不敏感）
+  const scale = Math.hypot(lm[5].x - lm[17].x, lm[5].y - lm[17].y) + 1e-6;
+
+  // 四指：指尖到手腕距离 大 => 伸直，小 => 弯曲
+  const fingers = [[8,6],[12,10],[16,14],[20,18]];
+  let extended = 0;
+  for (const [tip, pip] of fingers){
+    const dTip = Math.hypot(lm[tip].x - lm[0].x, lm[tip].y - lm[0].y);
+    const dPip = Math.hypot(lm[pip].x - lm[0].x, lm[pip].y - lm[0].y);
+    // 指尖明显比第二关节更远 => 手指伸直
+    extended += Math.min(1, Math.max(0, (dTip/dPip - 1.0) / 0.35));
+  }
+  // 拇指：到食指指根的横向张开
+  const thumb = Math.min(1, Math.hypot(lm[4].x - lm[5].x, lm[4].y - lm[5].y) / (scale*1.1));
+
+  const open = Math.min(1, Math.max(0, (extended + thumb) / 5));
+  return { palmX, palmY, open };
+}
+
+/* ---------- MediaPipe 回调（支持双手） ---------- */
+const handPrev = {};                 // 记录每只手上一帧位置，用于判断挥手
+const WAVE_SPEED = 0.045;            // 归一化速度阈值（越小越灵敏）
+const SCARE_RADIUS = 300;            // 惊吓半径（像素）
+
+// 让某只蝴蝶朝远离 (hx,hy) 的方向逃 dist 像素、持续 frames 帧
+function fleeFrom(b, hx, hy, dist, frames){
+  let nx = b.x - hx, ny = b.y - hy;
+  if (Math.hypot(nx, ny) < 1){ nx = Math.random()-0.5; ny = Math.random()-0.5; }
+  const len = Math.hypot(nx, ny) || 1;
+  b.fleeX = b.x + nx/len * dist;
+  b.fleeY = b.y + ny/len * dist;
+  b.fleeT = Math.max(b.fleeT, frames);
+}
+
+// 挥手：周围的自由生物（蝴蝶+萤火虫）只飞远一点点（不要太远）
+function scareCreatures(hx, hy){
+  for (const b of [...butterflies, ...fireflies]){
+    if (b.onHand) continue;          // 手里那只单独处理
+    const d = Math.hypot(b.x - hx, b.y - hy);
+    if (d > SCARE_RADIUS) continue;
+    const k = 1 - d / SCARE_RADIUS;                 // 越近退得略多
+    fleeFrom(b, hx, hy, 80 + 80*k, 26 + (18*k|0));  // 只小幅退开
+  }
+}
+
+function onResults(res){
+  // 收集本帧出现的手，用左右手标签作为稳定的键
+  const present = {};
+  if (res.multiHandLandmarks){
+    for (let i = 0; i < res.multiHandLandmarks.length; i++){
+      const label = (res.multiHandedness && res.multiHandedness[i] && res.multiHandedness[i].label) || ('hand' + i);
+      present[label] = analyzeHand(res.multiHandLandmarks[i]);
+    }
+  }
+
+  const all = [...butterflies, ...fireflies];   // 蝴蝶与萤火虫都能被抓
+
+  // 手消失了 -> 它抓着的生物恢复自由（允许短暂丢失若干帧，握拳时手型易抖动/漏检）
+  const LOST_GRACE = 10;
+  for (const c of all){
+    if (!c.hand) continue;
+    if (present[c.hand]){ c.lost = 0; }
+    else {
+      c.lost = (c.lost || 0) + 1;
+      if (c.lost > LOST_GRACE){ c.hand = null; c.onHand = false; c.lost = 0; }
+    }
+  }
+  for (const k in handPrev){ if (!present[k]) delete handPrev[k]; }
+
+  // 挥手检测：手移动过快 -> 手里的那只飞走、周围的略退开
+  const waving = {};
+  for (const label in present){
+    const info = present[label];
+    const prev = handPrev[label];
+    if (prev){
+      const speed = Math.hypot(info.palmX - prev.x, info.palmY - prev.y);
+      if (speed > WAVE_SPEED){
+        waving[label] = true;
+        const hpx = info.palmX * W, hpy = info.palmY * H - 8;
+        // 只有手里那只处于"张开"状态时，挥手才把它甩飞；
+        // 握拳（挤压绘画/擦除）时无论移动多快都不放手 —— 用滞回后的稳定状态，避开单帧噪声
+        const held = all.find(x => x.hand === label);
+        if (held && held.handOpen){
+          held.hand = null; held.onHand = false; fleeFrom(held, hpx, hpy, 340, 75);
+        }
+        scareCreatures(hpx, hpy);   // 周围的自由生物只飞远一点点
+      }
+    }
+    handPrev[label] = { x: info.palmX, y: info.palmY };
+  }
+
+  // 为每只出现的手分配 / 更新一只生物（离手最近的蝴蝶或萤火虫）
+  for (const label in present){
+    const info = present[label];
+    const hx = info.palmX * W;              // MediaPipe 为未镜像归一化坐标
+    const hy = info.palmY * H - 8;          // 略停在手掌上方
+
+    let c = all.find(x => x.hand === label);
+    if (!c && !waving[label] && info.open > 0.5){
+      // 只有手张开且未在挥动时才抓新的（捏合/挥动时不换、不抓其他蝴蝶；已握住的继续跟随）
+      let best = null, bd = Infinity;
+      for (const x of all){
+        if (x.hand) continue;
+        const d = (x.x - hx)**2 + (x.y - hy)**2;
+        if (d < bd){ bd = d; best = x; }
+      }
+      c = best;
+      if (c) c.hand = label;
+    }
+    if (c){
+      c.onHand = true;
+      c.targetX = hx; c.targetY = hy;
+      // 只有两种状态：张开 / 握拳（带滞回，避免临界处抖动）
+      if (info.open > 0.6) c.handOpen = true;
+      else if (info.open < 0.35) c.handOpen = false;
+      c.targetOpen = c.handOpen ? 1 : 0;
+    }
+  }
+}
+
+/* ---------- 绘制蝴蝶（帝王蝶 Monarch，正上方视角） ---------- */
+function drawButterfly(b){
+  ctx.save();
+  ctx.translate(b.x, b.y);
+
+  // 朝向：飞行时朝向移动方向；停在手上时端正竖立、头朝上
+  const angle = Math.atan2(b.vy, b.vx);
+  const heading = b.onHand ? 0 : angle + Math.PI/2;
+  ctx.rotate(heading);
+
+  const size = b.size;
+
+  // 扇翅：停手上轻缓、飞行时快
+  const flapAmp = b.onHand ? 0.09 : 0.30;
+  const flap = 1 - flapAmp + Math.sin(b.flap) * flapAmp;   // 约 0.6~1
+
+  // 关键：张开程度 -> 翅膀的“水平投影”。
+  // openness=1 平展；openness=0 时两翅向中间竖直折叠 -> 收成一条线(≈0.03)
+  const spread = 0.03 + b.openness * 0.97;
+  const wingScaleX = spread * flap;
+
+  // 合翅时露出较浅的翅膀“背面”颜色
+  const back = 1 - b.openness;   // 0=正面(展开) 1=背面(闭合)
+
+  // 阴影让蝴蝶像停在手上而非贴在画面
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.35)';
+  ctx.shadowBlur = size*0.25; ctx.shadowOffsetY = size*0.12;
+
+  for (const dir of [-1, 1]){        // 左右两片翅膀
+    ctx.save();
+    ctx.scale(dir, 1);               // 镜像成左/右
+    ctx.scale(wingScaleX, 1);        // 张合 = 水平收拢
+    drawWing(size, back, b.type);
+    ctx.restore();
+  }
+  ctx.restore();
+
+  drawBody(size, b.type);
+  ctx.restore();
+}
+
+/* ---- 颜色与形状工具 ---- */
+const hsl = a => `hsl(${a[0]},${a[1]}%,${a[2]}%)`;
+const mixL = (a, d) => [a[0], a[1], Math.max(6, Math.min(96, a[2] + d))];
+
+// 前翅路径（+x 伸出；身体轴沿 y，头在 -y）
+function buildFore(size, t){
+  const f = new Path2D();
+  if (t.style === 'tiger'){                 // 更修长、翅尖更尖
+    f.moveTo(0,-size*0.14);
+    f.bezierCurveTo(size*0.18,-size*0.82, size*0.80,-size*0.98, size*1.12,-size*0.55);
+    f.bezierCurveTo(size*1.16,-size*0.40, size*1.02,-size*0.26, size*0.86,-size*0.12);
+    f.bezierCurveTo(size*0.55,-size*0.01, size*0.26,0, 0,size*0.05);
+  } else {
+    f.moveTo(0,-size*0.12);
+    f.bezierCurveTo(size*0.16,-size*0.76, size*0.76,-size*0.88, size*1.05,-size*0.52);
+    f.bezierCurveTo(size*1.12,-size*0.38, size*1.02,-size*0.24, size*0.9,-size*0.12);
+    f.bezierCurveTo(size*0.58,-size*0.01, size*0.28,0, 0,size*0.05);
+  }
+  f.closePath();
+  return f;
+}
+
+// 后翅路径（虎凤蝶带燕尾）
+function buildHind(size, t){
+  const h = new Path2D();
+  if (t.style === 'tiger' || t.style === 'emerald' || t.style === 'blackswallow'){
+    h.moveTo(0,size*0.03);
+    h.bezierCurveTo(size*0.34,size*0.10, size*0.66,size*0.30, size*0.62,size*0.52);
+    h.bezierCurveTo(size*0.60,size*0.66, size*0.54,size*0.74, size*0.50,size*0.86);
+    h.lineTo(size*0.46,size*1.16);          // 燕尾尖
+    h.lineTo(size*0.38,size*0.88);
+    h.bezierCurveTo(size*0.24,size*0.92, size*0.08,size*0.66, 0,size*0.33);
+  } else {
+    h.moveTo(0,size*0.03);
+    h.bezierCurveTo(size*0.36,size*0.08, size*0.72,size*0.30, size*0.68,size*0.57);
+    h.bezierCurveTo(size*0.66,size*0.82, size*0.42,size*0.93, size*0.20,size*0.88);
+    h.bezierCurveTo(size*0.10,size*0.86, size*0.03,size*0.60, 0,size*0.33);
+  }
+  h.closePath();
+  return h;
+}
+
+// 同心眼斑
+function eyespot(x, y, r, rings){
+  for (const [rr, col] of rings){
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, r*rr, 0, 7); ctx.fill();
+  }
+}
+
+// 一片翅膀：按种类绘制正面花纹，合翅时叠加较浅的背面色
+function drawWing(size, back, t){
+  const fore = buildFore(size, t);
+  const hind = buildHind(size, t);
+
+  switch (t.style){
+    case 'monarch': paintMonarch(size,t,fore,hind); break;
+    case 'morpho':  paintMorpho(size,t,fore,hind);  break;
+    case 'tiger':   paintTiger(size,t,fore,hind);   break;
+    case 'peacock': paintPeacock(size,t,fore,hind); break;
+    case 'admiral': paintAdmiral(size,t,fore,hind); break;
+    case 'cabbage': paintCabbage(size,t,fore,hind); break;
+    case 'emerald':     paintEmerald(size,t,fore,hind);     break;
+    case 'bluebottle':  paintBluebottle(size,t,fore,hind);  break;
+    case 'emperor':     paintEmperor(size,t,fore,hind);     break;
+    case 'cattleheart': paintCattleheart(size,t,fore,hind); break;
+    case 'blackswallow':paintBlackSwallow(size,t,fore,hind);break;
+  }
+
+  if (back > 0.01){                          // 折叠时露出较浅的翅膀背面
+    ctx.save();
+    ctx.globalAlpha = back * 0.85;
+    ctx.fillStyle = hsl(t.under || [35,20,55]);
+    ctx.fill(fore); ctx.fill(hind);
+    ctx.restore();
+  }
+}
+
+// 帝王蝶：橙底 + 黑脉 + 粗黑边 + 双排白斑
+function paintMonarch(size,t,fore,hind){
+  const g = ctx.createRadialGradient(0,size*0.1,size*0.1, 0,size*0.1,size*1.15);
+  g.addColorStop(0, hsl(t.deep)); g.addColorStop(0.55, hsl(t.up)); g.addColorStop(1, hsl(t.deep));
+  ctx.fillStyle = g; ctx.fill(hind); ctx.fill(fore);
+
+  const dark = hsl(t.edge);
+  ctx.save(); ctx.clip(fore);
+  ctx.strokeStyle = dark; ctx.lineWidth = size*0.026; ctx.lineCap='round'; ctx.beginPath();
+  for (const k of [-0.62,-0.5,-0.36,-0.22,-0.08]){ ctx.moveTo(0,-size*0.02); ctx.quadraticCurveTo(size*0.5,-size*0.12, size*1.05, size*k); }
+  ctx.stroke(); ctx.restore();
+
+  ctx.save(); ctx.clip(hind);
+  ctx.strokeStyle = dark; ctx.lineWidth = size*0.026; ctx.beginPath();
+  for (const k of [0.15,0.34,0.53,0.72]){ ctx.moveTo(0,size*0.06); ctx.quadraticCurveTo(size*0.35,size*0.30, size*0.64, size*k); }
+  ctx.stroke(); ctx.restore();
+
+  ctx.strokeStyle = dark; ctx.lineJoin='round';
+  ctx.lineWidth = size*0.10; ctx.stroke(fore);
+  ctx.lineWidth = size*0.11; ctx.stroke(hind);
+
+  ctx.fillStyle = hsl(t.spot);
+  for (const [sx,sy,r] of [[0.96,-0.5,0.036],[1.0,-0.36,0.04],[0.94,-0.22,0.034],[0.82,-0.10,0.03],[0.64,-0.02,0.028]]){
+    ctx.beginPath(); ctx.arc(size*sx,size*sy,size*r,0,7); ctx.fill();
+  }
+  for (const [sx,sy] of [[0.62,0.56],[0.52,0.70],[0.38,0.80],[0.22,0.84]]){
+    ctx.beginPath(); ctx.arc(size*sx,size*sy,size*0.026,0,7); ctx.fill();
+  }
+}
+
+// 蓝闪蝶：纯金属蓝 + 虹彩高光 + 薄黑边 + 边缘小白点
+function paintMorpho(size,t,fore,hind){
+  const g = ctx.createRadialGradient(size*0.15,size*0.05,size*0.05, size*0.2,size*0.2,size*1.2);
+  g.addColorStop(0, hsl(t.sheen)); g.addColorStop(0.5, hsl(t.up)); g.addColorStop(1, hsl(mixL(t.up,-18)));
+  ctx.fillStyle = g; ctx.fill(hind); ctx.fill(fore);
+
+  ctx.save(); ctx.clip(fore);
+  const s = ctx.createLinearGradient(0,-size*0.6, size*0.9,0);
+  s.addColorStop(0,'rgba(255,255,255,0.35)'); s.addColorStop(0.4,'rgba(180,230,255,0.15)'); s.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle = s; ctx.fill(fore); ctx.restore();
+
+  ctx.strokeStyle = hsl(t.edge); ctx.lineJoin='round'; ctx.lineWidth = size*0.05;
+  ctx.stroke(fore); ctx.stroke(hind);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  for (const [sx,sy] of [[0.55,0.62],[0.42,0.75],[0.28,0.82]]){ ctx.beginPath(); ctx.arc(size*sx,size*sy,size*0.02,0,7); ctx.fill(); }
+}
+
+// 虎凤蝶：黄底 + 前翅黑虎纹 + 后翅蓝鳞橙斑 + 燕尾 + 粗黑边
+function paintTiger(size,t,fore,hind){
+  const g = ctx.createRadialGradient(0,size*0.1,size*0.08, 0,size*0.1,size*1.15);
+  g.addColorStop(0, hsl(t.deep)); g.addColorStop(0.6, hsl(t.up)); g.addColorStop(1, hsl(t.deep));
+  ctx.fillStyle = g; ctx.fill(hind); ctx.fill(fore);
+
+  const dark = hsl(t.edge);
+  ctx.save(); ctx.clip(fore);                 // 前翅黑虎纹
+  ctx.strokeStyle = dark; ctx.lineCap='round'; ctx.lineWidth = size*0.07; ctx.beginPath();
+  for (const k of [0.30,0.52,0.74,0.96]){ ctx.moveTo(size*k*0.9,-size*0.9); ctx.lineTo(size*k*0.55,size*0.08); }
+  ctx.moveTo(size*0.03,-size*0.6); ctx.lineTo(size*0.03,size*0.05);
+  ctx.stroke(); ctx.restore();
+
+  ctx.save(); ctx.clip(hind);                 // 后翅蓝鳞 + 橙斑
+  ctx.fillStyle = hsl(t.blue);
+  for (const [sx,sy] of [[0.6,0.5],[0.5,0.62],[0.4,0.72],[0.3,0.78]]){ ctx.beginPath(); ctx.arc(size*sx,size*sy,size*0.05,0,7); ctx.fill(); }
+  ctx.fillStyle = hsl(t.orange);
+  ctx.beginPath(); ctx.arc(size*0.30,size*0.84,size*0.05,0,7); ctx.fill();
+  ctx.restore();
+
+  ctx.strokeStyle = dark; ctx.lineJoin='round'; ctx.lineWidth = size*0.09;
+  ctx.stroke(fore); ctx.stroke(hind);
+}
+
+// 孔雀蛱蝶：酒红底 + 前后翅各一枚大眼斑
+function paintPeacock(size,t,fore,hind){
+  const g = ctx.createRadialGradient(0,size*0.1,size*0.08, 0,size*0.1,size*1.15);
+  g.addColorStop(0, hsl(t.up)); g.addColorStop(1, hsl(t.deep));
+  ctx.fillStyle = g; ctx.fill(hind); ctx.fill(fore);
+
+  ctx.save(); ctx.clip(fore);
+  eyespot(size*0.72,-size*0.42, size*0.24, [[1,'#17100a'],[0.72,hsl([50,90,60])],[0.42,hsl([258,55,42])],[0.2,hsl([205,85,62])]]);
+  ctx.restore();
+  ctx.save(); ctx.clip(hind);
+  eyespot(size*0.40,size*0.52, size*0.22, [[1,'#17100a'],[0.6,hsl([210,70,55])],[0.28,'#e8eeff']]);
+  ctx.restore();
+
+  ctx.strokeStyle = hsl(t.edge); ctx.lineJoin='round'; ctx.lineWidth = size*0.06;
+  ctx.stroke(fore); ctx.stroke(hind);
+}
+
+// 红蛱蝶：黑底 + 前翅斜红带 + 顶角白点 + 后翅外缘红带
+function paintAdmiral(size,t,fore,hind){
+  ctx.fillStyle = hsl(t.up); ctx.fill(hind); ctx.fill(fore);
+  const red = hsl(t.band);
+
+  ctx.save(); ctx.clip(fore);
+  ctx.strokeStyle = red; ctx.lineCap='round'; ctx.lineWidth = size*0.15;
+  ctx.beginPath(); ctx.moveTo(size*0.12,size*0.03); ctx.lineTo(size*0.98,-size*0.44); ctx.stroke();
+  ctx.fillStyle = hsl(t.spot);
+  for (const [sx,sy] of [[0.9,-0.5],[1.0,-0.4],[0.82,-0.33]]){ ctx.beginPath(); ctx.arc(size*sx,size*sy,size*0.03,0,7); ctx.fill(); }
+  ctx.restore();
+
+  ctx.save(); ctx.clip(hind);
+  ctx.strokeStyle = red; ctx.lineWidth = size*0.11; ctx.stroke(hind);
+  ctx.fillStyle = '#111';
+  for (const [sx,sy] of [[0.55,0.62],[0.42,0.74],[0.28,0.80]]){ ctx.beginPath(); ctx.arc(size*sx,size*sy,size*0.02,0,7); ctx.fill(); }
+  ctx.restore();
+
+  ctx.strokeStyle = '#0a0a0a'; ctx.lineJoin='round'; ctx.lineWidth = size*0.05;
+  ctx.stroke(fore); ctx.stroke(hind);
+}
+
+// 菜粉蝶：白翅 + 前翅炭灰翅尖 + 黑斑
+function paintCabbage(size,t,fore,hind){
+  const g = ctx.createRadialGradient(0,size*0.1,size*0.1, 0,size*0.1,size*1.15);
+  g.addColorStop(0, hsl(t.up)); g.addColorStop(1, hsl(t.deep));
+  ctx.fillStyle = g; ctx.fill(hind); ctx.fill(fore);
+
+  ctx.save(); ctx.clip(fore);
+  ctx.fillStyle = hsl(t.tip);                 // 翅尖炭灰
+  ctx.beginPath();
+  ctx.moveTo(size*0.7,-size*0.5); ctx.quadraticCurveTo(size*1.12,-size*0.5, size*1.05,-size*0.18);
+  ctx.quadraticCurveTo(size*0.95,-size*0.3, size*0.7,-size*0.5); ctx.fill();
+  ctx.fillStyle = hsl(t.spot);                // 黑斑
+  ctx.beginPath(); ctx.arc(size*0.55,-size*0.05,size*0.06,0,7); ctx.fill();
+  ctx.restore();
+
+  ctx.strokeStyle = 'rgba(120,120,120,0.4)'; ctx.lineJoin='round'; ctx.lineWidth = size*0.02;
+  ctx.stroke(fore); ctx.stroke(hind);
+}
+
+// 翠凤蝶：黑绿底 + 亮翠绿金属带 + 燕尾 + 边缘蓝橙小斑
+function paintEmerald(size,t,fore,hind){
+  const g = ctx.createRadialGradient(0,size*0.1,size*0.08, 0,size*0.1,size*1.15);
+  g.addColorStop(0, hsl(t.deep)); g.addColorStop(0.7, hsl(t.up)); g.addColorStop(1, hsl(t.deep));
+  ctx.fillStyle = g; ctx.fill(hind); ctx.fill(fore);
+
+  const band = ctx.createLinearGradient(0,0,size,0);
+  band.addColorStop(0, hsl(t.band)); band.addColorStop(0.5, hsl(t.core)); band.addColorStop(1, hsl(t.band));
+  ctx.save(); ctx.clip(fore);
+  ctx.strokeStyle = band; ctx.lineCap='round'; ctx.lineWidth = size*0.22;
+  ctx.beginPath(); ctx.moveTo(size*0.12,-size*0.02); ctx.quadraticCurveTo(size*0.6,-size*0.2, size*0.95,-size*0.4); ctx.stroke();
+  ctx.restore();
+
+  ctx.save(); ctx.clip(hind);
+  ctx.strokeStyle = band; ctx.lineWidth = size*0.20;
+  ctx.beginPath(); ctx.moveTo(size*0.08,size*0.2); ctx.quadraticCurveTo(size*0.4,size*0.35, size*0.5,size*0.7); ctx.stroke();
+  ctx.fillStyle = hsl(t.spotA); ctx.beginPath(); ctx.arc(size*0.4,size*0.82,size*0.04,0,7); ctx.fill();
+  ctx.fillStyle = hsl(t.spotB); ctx.beginPath(); ctx.arc(size*0.27,size*0.80,size*0.035,0,7); ctx.fill();
+  ctx.restore();
+
+  ctx.strokeStyle = hsl(t.edge); ctx.lineJoin='round'; ctx.lineWidth = size*0.07;
+  ctx.stroke(fore); ctx.stroke(hind);
+}
+
+// 青凤蝶：黑翅 + 中央青绿透光带（平行于身体）
+function paintBluebottle(size,t,fore,hind){
+  ctx.fillStyle = hsl(t.up); ctx.fill(hind); ctx.fill(fore);
+  const bg = ctx.createLinearGradient(size*0.05,0, size*0.6,0);
+  bg.addColorStop(0, hsl(t.core)); bg.addColorStop(0.55, hsl(t.band)); bg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.save(); ctx.clip(fore); ctx.fillStyle = bg; ctx.fillRect(size*0.05,-size,size*0.55,size*2); ctx.restore();
+  ctx.save(); ctx.clip(hind); ctx.fillStyle = bg; ctx.fillRect(size*0.05,-size,size*0.55,size*2); ctx.restore();
+
+  ctx.strokeStyle = hsl(t.edge); ctx.lineJoin='round'; ctx.lineWidth = size*0.05;
+  ctx.stroke(fore); ctx.stroke(hind);
+}
+
+// 紫闪蛱蝶：棕底 + 紫色虹彩 + 白带白斑 + 后翅橙环
+function paintEmperor(size,t,fore,hind){
+  const g = ctx.createRadialGradient(size*0.1,0,size*0.05, size*0.15,size*0.1,size*1.2);
+  g.addColorStop(0, hsl(t.sheen)); g.addColorStop(0.45, hsl(t.up)); g.addColorStop(1, hsl(t.deep));
+  ctx.fillStyle = g; ctx.fill(hind); ctx.fill(fore);
+
+  ctx.save(); ctx.clip(fore);
+  ctx.fillStyle = hsl(t.band);
+  for (const [sx,sy,r] of [[0.4,-0.12,0.05],[0.5,-0.3,0.06],[0.62,-0.36,0.055],[0.74,-0.42,0.05],[0.86,-0.46,0.04]]){
+    ctx.beginPath(); ctx.arc(size*sx,size*sy,size*r,0,7); ctx.fill();
+  }
+  ctx.restore();
+
+  ctx.save(); ctx.clip(hind);
+  ctx.strokeStyle = hsl(t.band); ctx.lineCap='round'; ctx.lineWidth = size*0.09;
+  ctx.beginPath(); ctx.moveTo(size*0.12,size*0.28); ctx.quadraticCurveTo(size*0.4,size*0.34, size*0.5,size*0.55); ctx.stroke();
+  eyespot(size*0.34,size*0.68, size*0.09, [[1,hsl(t.ring)],[0.5,'#1a0e08']]);
+  ctx.restore();
+
+  ctx.strokeStyle = hsl(t.edge); ctx.lineJoin='round'; ctx.lineWidth = size*0.05;
+  ctx.stroke(fore); ctx.stroke(hind);
+}
+
+// 粉心翼凤蝶：丝绒黑 + 后翅亮粉斑列 + 前翅绿斑
+function paintCattleheart(size,t,fore,hind){
+  const g = ctx.createRadialGradient(0,size*0.1,size*0.1, 0,size*0.1,size*1.15);
+  g.addColorStop(0, hsl(t.deep)); g.addColorStop(1, hsl(t.up));
+  ctx.fillStyle = g; ctx.fill(hind); ctx.fill(fore);
+
+  ctx.save(); ctx.clip(fore);
+  ctx.fillStyle = hsl(t.green);
+  for (const [sx,sy] of [[0.5,-0.2],[0.62,-0.28],[0.4,-0.08]]){ ctx.beginPath(); ctx.arc(size*sx,size*sy,size*0.035,0,7); ctx.fill(); }
+  ctx.restore();
+
+  ctx.save(); ctx.clip(hind);
+  ctx.fillStyle = hsl(t.pink);
+  for (const [sx,sy,r] of [[0.55,0.5,0.055],[0.46,0.62,0.06],[0.34,0.72,0.055],[0.22,0.76,0.048],[0.14,0.68,0.04]]){
+    ctx.beginPath(); ctx.arc(size*sx,size*sy,size*r,0,7); ctx.fill();
+  }
+  ctx.restore();
+
+  ctx.strokeStyle = hsl(t.edge); ctx.lineJoin='round'; ctx.lineWidth = size*0.05;
+  ctx.stroke(fore); ctx.stroke(hind);
+}
+
+// 黑凤蝶：黑底 + 成排奶油色斑点 + 后翅蓝带 + 橙色眼斑（黑瞳）+ 燕尾
+function paintBlackSwallow(size,t,fore,hind){
+  const g = ctx.createRadialGradient(0,size*0.1,size*0.08, 0,size*0.1,size*1.15);
+  g.addColorStop(0, hsl(t.deep)); g.addColorStop(0.7, hsl(t.up)); g.addColorStop(1, hsl(t.deep));
+  ctx.fillStyle = g; ctx.fill(hind); ctx.fill(fore);
+
+  const cream = hsl(t.spot);
+
+  // 前翅：两排奶油色斑点（近缘一排大、边缘一排小）
+  ctx.save(); ctx.clip(fore);
+  ctx.fillStyle = cream;
+  for (const [sx,sy,r] of [[0.34,-0.4,0.05],[0.5,-0.47,0.055],[0.64,-0.5,0.05],[0.78,-0.5,0.045],[0.9,-0.46,0.038]]){
+    ctx.beginPath(); ctx.arc(size*sx,size*sy,size*r,0,7); ctx.fill();
+  }
+  for (const [sx,sy] of [[0.46,-0.16],[0.6,-0.2],[0.74,-0.22],[0.86,-0.22],[0.94,-0.18]]){
+    ctx.beginPath(); ctx.arc(size*sx,size*sy,size*0.024,0,7); ctx.fill();
+  }
+  ctx.restore();
+
+  // 后翅：蓝带 + 边缘奶油斑 + 橙色眼斑
+  ctx.save(); ctx.clip(hind);
+  const bl = ctx.createLinearGradient(0,size*0.35,size*0.6,size*0.65);
+  bl.addColorStop(0, hsl([210,70,42])); bl.addColorStop(1, hsl(t.blue));
+  ctx.fillStyle = bl;
+  for (const [sx,sy,r] of [[0.2,0.55,0.07],[0.32,0.52,0.085],[0.44,0.55,0.085],[0.54,0.55,0.075],[0.62,0.5,0.06]]){
+    ctx.beginPath(); ctx.arc(size*sx,size*sy,size*r,0,7); ctx.fill();
+  }
+  ctx.fillStyle = cream;
+  for (const [sx,sy] of [[0.18,0.72],[0.3,0.78],[0.42,0.82],[0.52,0.8],[0.6,0.72]]){
+    ctx.beginPath(); ctx.arc(size*sx,size*sy,size*0.028,0,7); ctx.fill();
+  }
+  eyespot(size*0.2,size*0.72, size*0.085, [[1,hsl(t.orange)],[0.5,hsl(t.edge)]]);
+  ctx.restore();
+
+  ctx.strokeStyle = hsl(t.edge); ctx.lineJoin='round'; ctx.lineWidth = size*0.055;
+  ctx.stroke(fore); ctx.stroke(hind);
+}
+
+// 身体：胸部 + 腹部 + 头 + 触角
+function drawBody(size, t){
+  const bg = ctx.createLinearGradient(-size*0.09,0, size*0.09,0);
+  bg.addColorStop(0,'#0b0806'); bg.addColorStop(0.5,'#3c2b20'); bg.addColorStop(1,'#0b0806');
+  ctx.fillStyle = bg;
+  ctx.beginPath(); ctx.ellipse(0, size*0.18, size*0.072, size*0.6, 0, 0, 7); ctx.fill(); // 腹部
+  ctx.beginPath(); ctx.ellipse(0,-size*0.26, size*0.09, size*0.22, 0, 0, 7); ctx.fill(); // 胸部
+
+  // 身上白点（帝王蝶特征；其他种类身体为素色）
+  if (t && t.style === 'monarch'){
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    for (let i=0;i<8;i++){
+      ctx.beginPath();
+      ctx.arc(size*0.035*(i%2?1:-1), -size*0.32 + i*size*0.115, size*0.014, 0, 7);
+      ctx.fill();
+    }
+  }
+
+  // 头
+  ctx.fillStyle = '#0b0806';
+  ctx.beginPath(); ctx.arc(0,-size*0.47, size*0.078, 0, 7); ctx.fill();
+
+  // 触角 + 末端小球
+  ctx.strokeStyle = '#0b0806'; ctx.lineWidth = size*0.022; ctx.lineCap='round';
+  ctx.beginPath();
+  ctx.moveTo(0,-size*0.5); ctx.quadraticCurveTo(-size*0.13,-size*0.78,-size*0.21,-size*0.8);
+  ctx.moveTo(0,-size*0.5); ctx.quadraticCurveTo( size*0.13,-size*0.78, size*0.21,-size*0.8);
+  ctx.stroke();
+  ctx.fillStyle = '#0b0806';
+  ctx.beginPath(); ctx.arc(-size*0.21,-size*0.8, size*0.026, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc( size*0.21,-size*0.8, size*0.026, 0, 7); ctx.fill();
+}
+
+/* ---------- 花粉 & 绘画 ---------- */
+// 每种蝴蝶对应的花粉/颜料色（取该species最鲜明的颜色）
+const DUST = {
+  monarch:[30,90,55], morpho:[210,90,62], tiger:[47,92,60], peacock:[352,78,55],
+  admiral:[8,88,55], cabbage:[50,25,92], emerald:[135,82,55], bluebottle:[175,85,62],
+  emperor:[275,70,60], cattleheart:[330,88,70], blackswallow:[0,0,10]
+};
+const dustColor = t => DUST[t.style] || t.up;
+
+const particles = [];              // 飞行时撒出的花粉（短命拖尾）
+const dust = [];                   // 挤压画出的粉尘（长寿命，在空中漂浮后消失）
+
+// 飞行时撒花粉
+function emitPollen(b){
+  if (b.onHand) return;            // 停在手上时不撒
+  if (Math.random() > 0.65) return;
+  const [h,s,l] = dustColor(b.type);
+  particles.push({
+    x: b.x + (Math.random()-0.5)*b.size*0.35,
+    y: b.y + (Math.random()-0.5)*b.size*0.35,
+    vx: -b.vx*0.25 + (Math.random()-0.5)*0.7,
+    vy: -b.vy*0.25 + (Math.random()-0.5)*0.7 + 0.25,   // 略微下沉
+    life: 1, decay: 0.007 + Math.random()*0.01,
+    size: 1.4 + Math.random()*2.6, h, s, l
+  });
+  if (particles.length > 1400) particles.splice(0, particles.length - 1400);
+}
+
+function updateParticles(){
+  for (let i = particles.length - 1; i >= 0; i--){
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy; p.vy += 0.012; p.vx *= 0.99; p.vy *= 0.99;
+    p.life -= p.decay;
+    if (p.life <= 0){ particles.splice(i, 1); continue; }
+    ctx.globalAlpha = p.life * 0.85;
+    ctx.fillStyle = `hsl(${p.h},${p.s}%,${p.l}%)`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// 挤压时喷出粉尘颗粒（像涂鸦笔留痕，但每一粒都会在空中漂浮后消失）
+// bsize：画笔蝴蝶的大小 -> 笔画粗细随之变化
+function spawnDust(x, y, t, strength, bsize){
+  const [h,s,l] = dustColor(t);
+  const BRUSH_THICK = 1.6;   // 画笔整体加粗
+  const BRUSH_DENSE = 2.2;   // 画笔整体加密（每次喷更多颗粒）
+  // 粗细系数：基准随蝴蝶缩小同步缩小 -> 不同大小仍有粗细差异；再乘整体加粗系数
+  const nominal = 80 * BFLY_SHRINK;
+  const f = Math.max(0.55, Math.min(1.8, (bsize || nominal) / nominal)) * BRUSH_THICK;
+  const n = Math.max(2, Math.round((3 + strength*4) * BRUSH_DENSE));
+  for (let i = 0; i < n; i++){
+    const a = Math.random()*Math.PI*2, r = Math.random()*16*strength*f;   // 越大的蝴蝶笔画越宽
+    dust.push({
+      x: x + Math.cos(a)*r, y: y + Math.sin(a)*r,
+      vx: (Math.random()-0.5)*0.035,                // 初速很小，先保住画的形状
+      vy: (Math.random()-0.5)*0.035 - 0.012,
+      ox: Math.cos(a), oy: Math.sin(a),             // 向外发散的方向
+      life: 1, decay: 0.00045 + Math.random()*0.00045, // 更慢：约 22~37 秒后才消失
+      size: (1.5 + Math.random()*2.6) * f,              // 颗粒也随蝴蝶大小
+      h, s, l, ph: Math.random()*6.28, sw: 0.008 + Math.random()*0.018
+    });
+  }
+  if (dust.length > 7000) dust.splice(0, dust.length - 7000);
+}
+
+// 粉尘：缓慢上浮、随气流轻摆，逐渐变淡直至消失
+function updateDust(){
+  for (let i = dust.length - 1; i >= 0; i--){
+    const p = dust[i];
+    p.ph += p.sw;
+    // 持续向外的漂移 + 少量布朗扰动 -> 粉尘团随时间慢慢往外发散（速度很慢）
+    p.vx += p.ox * 0.0007 + (Math.random()-0.5) * 0.0035;
+    p.vy += p.oy * 0.0007 + (Math.random()-0.5) * 0.0035;
+    p.vx *= 0.985; p.vy *= 0.985;            // 阻尼，保持缓慢
+    p.x += p.vx + Math.cos(p.ph) * 0.06;    // 横向轻摆，像空气中的浮尘
+    p.y += p.vy - 0.005;                     // 轻微上浮
+    p.life -= p.decay;
+    if (p.life <= 0){ dust.splice(i, 1); continue; }
+    ctx.globalAlpha = Math.min(1, p.life * 1.4) * 0.55;   // 尾段渐隐
+    ctx.fillStyle = `hsl(${p.h},${p.s}%,${p.l}%)`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ---------- 萤火虫 ---------- */
+// 吃掉 (x,y) 半径内的粉尘（life 越减越快直至消失）
+function eatDust(x, y, radius, rate){
+  const r2 = radius * radius;
+  for (let i = dust.length - 1; i >= 0; i--){
+    const p = dust[i];
+    const dx = p.x - x, dy = p.y - y;
+    if (dx*dx + dy*dy < r2){
+      p.life -= rate;
+      if (p.life <= 0) dust.splice(i, 1);
+    }
+  }
+}
+
+// 找离 (x,y) 最近的粉尘（供萤火虫觅食）
+function nearestDust(x, y){
+  let best = null, bd = Infinity;
+  for (const p of dust){
+    const d = (p.x - x)**2 + (p.y - y)**2;
+    if (d < bd){ bd = d; best = p; }
+  }
+  return best;
+}
+
+function updateFireflies(){
+  for (const f of fireflies){
+    f.wanderT += 0.02;
+    f.phase += 0.14;
+
+    if (!f.onHand){
+      if (f.fleeT > 0){
+        f.fleeT--;
+        f.targetX = f.fleeX; f.targetY = f.fleeY;
+      } else {
+        // 觅食：飞向最近的粉尘去吃；没有画作时随意游荡
+        const prey = nearestDust(f.x, f.y);
+        if (prey){ f.targetX = prey.x; f.targetY = prey.y; }
+        else {
+          f.targetX = W * (0.5 + f.ampx * Math.cos(f.wanderT * f.wsx + f.phx));
+          f.targetY = H * (0.5 + f.ampy * Math.sin(f.wanderT * f.wsy * 1.3 + f.phy));
+        }
+      }
+    }
+
+    const ease = f.onHand ? 0.16 : (f.fleeT > 0 ? 0.11 : 0.05);
+    f.vx = (f.targetX - f.x) * ease;
+    f.vy = (f.targetY - f.y) * ease;
+    f.x += f.vx; f.y += f.vy;
+    f.openness += (f.targetOpen - f.openness) * 0.18;
+
+    // 抓在手里 + 手掌张开 -> 和蝴蝶一样显示名字
+    updateLabel(f, f.onHand && f.openness > 0.7);
+
+    // 吃画：自由飞时小口啃；被抓住且握拳时当橡皮擦大范围清理
+    if (f.onHand){
+      if (f.openness < 0.4) eatDust(f.x, f.y, 80, 0.5);   // 抓住 + 握拳 = 快速清理
+    } else {
+      eatDust(f.x, f.y, 22, 0.03);                        // 自由飞时慢慢啃
+    }
+  }
+}
+
+function drawFirefly(f){
+  const eating = f.onHand && f.openness < 0.4;
+  const pulse = 0.55 + 0.45 * Math.sin(f.phase);
+  const R = f.size * (1.7 + 0.6 * pulse) * (eating ? 1.5 : 1);
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';        // 发光叠加
+  const g = ctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, R);
+  g.addColorStop(0,   `rgba(225,255,150,${0.9*pulse})`);
+  g.addColorStop(0.3, `rgba(170,225,80,${0.5*pulse})`);
+  g.addColorStop(1,   'rgba(120,200,40,0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(f.x, f.y, R, 0, 7); ctx.fill();
+  ctx.restore();
+
+  // 亮核 + 小身体
+  ctx.fillStyle = `rgba(255,255,225,0.95)`;
+  ctx.beginPath(); ctx.arc(f.x, f.y, f.size*0.32, 0, 7); ctx.fill();
+  ctx.fillStyle = '#2e2712';
+  ctx.beginPath(); ctx.ellipse(f.x, f.y + f.size*0.12, f.size*0.2, f.size*0.3, 0, 0, 7); ctx.fill();
+}
+
+/* ---------- 动画循环 ---------- */
+function tick(){
+  ctx.clearRect(0,0,W,H);
+
+  for (const b of butterflies){
+    b.wanderT += 0.012;
+    b.flap += (b.onHand ? 0.12 : 0.28) + (b.fleeT>0 ? 0.25 : 0);   // 受惊时扇翅更急
+
+    if (!b.onHand){
+      b.targetOpen = 1;
+      if (b.fleeT > 0){
+        // 受惊逃离：冲向远离手的方向
+        b.fleeT--;
+        b.targetX = b.fleeX; b.targetY = b.fleeY;
+      } else if (b.entering){
+        // 刚从边缘飞入：朝画面内飞，进入画面后转为随机游走
+        if (b.x > 0 && b.x < W && b.y > 0 && b.y < H) b.entering = false;
+      } else {
+        // 随机游走乱飞：接近目标就换一个随机方向（不刻意飞出）
+        if (Math.hypot(b.targetX - b.x, b.targetY - b.y) < 40 + b.size*0.3) newRoamTarget(b);
+        // 恰好飞出画布 -> 消失，补一只同花色新蝴蝶从边缘飞入
+        const off = b.size;
+        if (b.x < -off || b.x > W + off || b.y < -off || b.y > H + off) respawnButterfly(b);
+      }
+    }
+
+    // 平滑跟随（弹性）；飞行速度恒定，不加速
+    const ease = b.onHand ? 0.14 : (b.fleeT > 0 ? 0.11 : 0.03);
+    b.vx = (b.targetX - b.x) * ease;
+    b.vy = (b.targetY - b.y) * ease;
+    b.x += b.vx;
+    b.y += b.vy;
+
+    // 翅膀张合平滑过渡
+    b.openness += (b.targetOpen - b.openness) * 0.18;
+
+    // 停在手上时随手掌轻微起伏
+    if (b.onHand){ b.y += Math.sin(b.flap*0.5)*1.2; }
+
+    emitPollen(b);                     // 飞行时撒花粉
+
+    // 抓住 + 手掌张开 -> 显示名字弹窗
+    updateLabel(b, b.onHand && b.openness > 0.7);
+
+    // 抓住 + 握拳挤压 -> 喷出粉尘，在空中漂浮成画
+    if (b.onHand && b.openness < 0.4){
+      spawnDust(b.x, b.y, b.type, 1 - b.openness, b.size);   // 握得越紧喷得越多；越大笔画越粗
+    }
+  }
+
+  updateFireflies();                   // 萤火虫觅食/清理（先吃掉粉尘）
+  updateDust();                        // 更新+绘制剩余漂浮粉尘（最底层）
+  updateParticles();                   // 更新+绘制花粉（在蝴蝶之下）
+
+  // 停在手上的画在最上层
+  const order = [...butterflies].sort((a, c) => (a.onHand?1:0) - (c.onHand?1:0));
+  for (const b of order) drawButterfly(b);
+
+  for (const f of fireflies) drawFirefly(f);   // 萤火虫的光在最上层
+
+  requestAnimationFrame(tick);
+}
+
+/* ---------- 名字弹窗 ---------- */
+function updateLabel(b, show){
+  if (!show){
+    if (b.labelEl) b.labelEl.classList.remove('show');
+    return;
+  }
+  if (!b.labelEl){
+    const el = document.createElement('div');
+    el.className = 'label';
+    el.innerHTML = `<div class="nm"></div><div class="sci"></div>`;
+    labelsEl.appendChild(el);
+    el.querySelector('.nm').textContent = b.type ? b.type.name : 'Firefly';
+    el.querySelector('.sci').textContent = b.type ? b.type.sci : 'Lampyridae';
+    b.labelEl = el;
+  }
+  // 画布做了水平镜像，屏幕坐标 x = W - b.x；弹窗放在蝴蝶上方
+  const screenX = W - b.x;
+  const screenY = b.y - b.size * 0.7;
+  b.labelEl.style.left = screenX + 'px';
+  b.labelEl.style.top  = Math.max(28, screenY) + 'px';
+  b.labelEl.classList.add('show');
+}
+
+/* ---------- 启动 ---------- */
+let hands, camera;
+startBtn.addEventListener('click', async () => {
+  errEl.textContent = '';
+  startBtn.textContent = 'Starting…';
+  startBtn.disabled = true;
+  try {
+    if (typeof Hands === 'undefined') throw new Error('lib');
+
+    hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    });
+    hands.onResults(onResults);
+
+    camera = new Camera(video, {
+      onFrame: async () => { await hands.send({ image: video }); },
+      width: 1280, height: 720
+    });
+    await camera.start();
+
+    startScreen.style.display = 'none';
+    tick();
+  } catch (e) {
+    console.error(e);
+    startBtn.disabled = false;
+    startBtn.textContent = 'Retry';
+    if (e && e.message === 'lib'){
+      errEl.textContent = 'The hand-tracking library failed to load — check your internet connection and retry.';
+    } else if (e && (e.name === 'NotAllowedError' || e.name === 'NotFoundError')){
+      errEl.textContent = 'Camera access is required (please click “Allow” in the browser prompt).';
+    } else {
+      errEl.textContent = 'Failed to start: ' + (e.message || e);
+    }
+  }
+});
+</script>
+</body>
+</html>
