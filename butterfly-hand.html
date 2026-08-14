@@ -59,7 +59,7 @@
 <div id="start">
   <div class="emoji">🦋</div>
   <h1>Butterfly on Hand</h1>
-  <p>Several different butterflies are fluttering on screen. Hold out a hand (either one) and the nearest one flies over to land on it.<br>Open your fingers and the wings spread; make a fist and they fold. Open your palm to see its name.<br>Two fireflies drift around nibbling your paintings — catch one and make a fist to erase.</p>
+  <p>Several different butterflies are fluttering on screen. Hold out a hand (either one) and the nearest one flies over to land on it.<br>Open your fingers and the wings spread; make a fist and they fold. Open your palm to see its name.<br>Squeeze it into a fist to paint — the dust it sprays will drift over and gradually cling to your body's outline.<br>Two fireflies drift around nibbling your paintings — catch one and make a fist to erase.</p>
   <button id="startBtn">Start Camera</button>
   <div id="err"></div>
 </div>
@@ -67,6 +67,8 @@
 <!-- MediaPipe Hands (loaded from CDN, needs internet) -->
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<!-- MediaPipe Selfie Segmentation：识别人体轮廓（含头部），供粉尘下坠后吸附用（可选，加载失败不影响其余功能） -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js" crossorigin="anonymous"></script>
 
 <script>
 const video  = document.getElementById('video');
@@ -150,6 +152,8 @@ function makeButterfly(){
     phy: Math.random()*6.28,
     ampx: 0.26 + Math.random()*0.16,
     ampy: 0.26 + Math.random()*0.16,
+    // 用于握拳画画时感知手部动作（快/慢/急转/停顿），驱动粉尘的颜色与形态变化
+    _prevAngle: null, _wasMoving: false,
   };
 }
 
@@ -763,16 +767,93 @@ function drawBody(size, t){
 }
 
 /* ---------- 花粉 & 绘画 ---------- */
-// 每种蝴蝶对应的花粉/颜料色（取该species最鲜明的颜色）
-const DUST = {
-  monarch:[30,90,55], morpho:[210,90,62], tiger:[47,92,60], peacock:[352,78,55],
-  admiral:[8,88,55], cabbage:[50,25,92], emerald:[135,82,55], bluebottle:[175,85,62],
-  emperor:[275,70,60], cattleheart:[330,88,70], blackswallow:[0,0,10]
+// 每种蝴蝶一套完整的调色板（深→主→浅→极浅→高光/特殊色），而不是单一颜色
+// 注：调色板里避免纯灰阶的黑（S≈0）——那种色调在深色背景下容易显脏/隐形，一律换成
+// 带一点点色相/饱和度的“近黑”，视觉上仍读作黑，但不是死灰。像黑凤蝶这种本来就是以黑色
+// 为主的真实种类，就把这种“近黑”定成主色（占比最高），不必强行换成别的颜色
+const PALETTE = {
+  monarch:     { deep:[18,82,30],  main:[28,90,52], light:[42,88,64], pale:[45,55,88], spark:[40,75,82] }, // 燃橙→橙→金黄→乳白 + 暖金闪光
+  morpho:      { deep:[255,65,20], main:[212,85,48],light:[188,88,62],pale:[200,45,86],spark:[205,15,95]}, // 深靛蓝→钴蓝→青→浅蓝 + 银白闪光
+  tiger:       { deep:[40,72,26],  main:[47,90,58], light:[50,72,76], pale:[48,40,90], spark:[212,70,55]}, // 焦黄→黄→浅黄→乳白 + 电光蓝
+  peacock:     { deep:[352,72,24], main:[352,68,42],light:[8,62,58],  pale:[18,45,82], spark:[46,85,62] }, // 深酒红→酒红→玫红→暖粉 + 金色
+  admiral:     { deep:[8,60,15],   main:[8,86,48],  light:[16,80,62], pale:[20,50,85], spark:[0,0,97]   }, // 深绯红→红橙→亮橙红→暖粉 + 白斑
+  cabbage:     { deep:[222,12,28], main:[50,20,90], light:[48,18,96], pale:[50,6,99],  spark:[72,32,76] }, // 炭灰→米白→近白→纯白 + 淡黄绿闪
+  emerald:     { deep:[140,50,10], main:[140,72,42],light:[124,76,58],pale:[130,42,82],spark:[210,72,60]}, // 黑绿→翠绿→亮草绿→薄荷 + 天蓝
+  bluebottle:  { deep:[195,55,16], main:[175,80,50],light:[170,74,64],pale:[170,42,85],spark:[165,88,76]}, // 深青→青绿→亮青→淡水色 + 亮青白
+  emperor:     { deep:[275,55,20], main:[270,55,45],light:[300,68,58],pale:[260,42,82],spark:[280,15,94]}, // 深紫→紫罗兰→洋红→薰衣草 + 珠光
+  cattleheart: { deep:[345,60,25], main:[335,62,50],light:[330,84,64],pale:[350,52,88],spark:[340,20,96]}, // 勃艮第→玫瑰→亮粉→浅粉 + 珍珠白
+  blackswallow:{ deep:[215,22,9],  main:[35,20,13], light:[0,0,17],   pale:[220,12,22], spark:[212,72,55]}, // 大部分近黑（冷/暖/中性三种近黑，有层次但不是死灰）+ 少部分电光蓝
 };
-const dustColor = t => DUST[t.style] || t.up;
+const paletteOf = t => PALETTE[t.style] || PALETTE.monarch;
+const dustColor = t => paletteOf(t).main;   // 尾部拖尾花粉仍用单一主色，保持原样简洁
+
+// 按 60% 主色 + 20% 浅色 + 10% 深色 + 10% 高光/特殊 的配比，从调色板里抽一颗粒子的色调
+// speedT：-1(手很慢) ~ 0(常速) ~ 1(手很快)，用于把配比向“浅/快”或“深/慢”偏移
+// 同时给 H/S/L 加上小幅随机抖动，避免同一批粒子颜色齐刷刷
+function pickDustTint(type, speedT){
+  const pal = paletteOf(type);
+  const t = Math.max(-1, Math.min(1, speedT || 0));
+  const wMain  = Math.max(0.05, 0.60 - t*0.14);
+  const wLight = Math.max(0.05, 0.20 + t*0.28);
+  const wDeep  = Math.max(0.02, 0.10 - t*0.07);
+  const wSpark = 0.10;
+  let r = Math.random() * (wMain + wLight + wDeep + wSpark), tier;
+  if ((r -= wMain) < 0) tier = 'main';
+  else if ((r -= wLight) < 0) tier = (Math.random() < 0.5 ? 'light' : 'pale');
+  else if ((r -= wDeep) < 0) tier = 'deep';
+  else tier = 'spark';
+  const [h0, s0, l0] = pal[tier];
+  return {
+    tier,
+    h: h0 + (Math.random()-0.5)*10,
+    s: Math.max(0, Math.min(100, s0 + (Math.random()-0.5)*14)),
+    l: Math.max(4, Math.min(97, l0 + (Math.random()-0.5)*12)),
+  };
+}
 
 const particles = [];              // 飞行时撒出的花粉（短命拖尾）
-const dust = [];                   // 挤压画出的粉尘（长寿命，在空中漂浮后消失）
+const dust = [];                   // 挤压画出的粉尘（长寿命，会逐渐吸附到身体轮廓上）
+
+/* ---------- 人体轮廓（Selfie Segmentation，用于让粉尘吸附） ---------- */
+// 把分割出的人形遮罩缩成一张小网格，供粉尘粒子低成本地采样、求梯度
+const SEG_GRID_W = 80, SEG_GRID_H = 45;
+let segGrid = null, segReady = false, segCanvas = null, segCtxOff = null;
+function initSegGrid(){
+  segCanvas = document.createElement('canvas');
+  segCanvas.width = SEG_GRID_W; segCanvas.height = SEG_GRID_H;
+  segCtxOff = segCanvas.getContext('2d', { willReadFrequently: true });
+  segGrid = new Float32Array(SEG_GRID_W * SEG_GRID_H);
+}
+function onSegResults(res){
+  if (!segCanvas) initSegGrid();
+  segCtxOff.clearRect(0, 0, SEG_GRID_W, SEG_GRID_H);   // 先清空，避免和上一帧残留像素混叠
+  segCtxOff.drawImage(res.segmentationMask, 0, 0, SEG_GRID_W, SEG_GRID_H);
+  const img = segCtxOff.getImageData(0, 0, SEG_GRID_W, SEG_GRID_H).data;
+  // 关键修正：MediaPipe 的 segmentationMask 把人体置信度编码在 Alpha 通道（RGB 基本是常量白色），
+  // 官方 demo 用 globalCompositeOperation='source-in' 抠图正是靠 Alpha 的变化——之前读的是 R 通道，
+  // 那基本是一整块常量（几乎处处非 0 就是 255），算出来的梯度恒为 0，吸附力永远不会触发。
+  for (let i = 0, j = 0; i < segGrid.length; i++, j += 4) segGrid[i] = img[j + 3] / 255;
+  if (!segReady) console.info('[body-outline] segmentation ready — dust will now seek your silhouette');
+  segReady = true;
+}
+// 采样“人体概率”（0=背景 1=人体）；nx/ny 为 0~1 归一化坐标，
+// 与 MediaPipe 手部关键点同一套未镜像坐标系，因此可以直接用 x/W, y/H 采样。
+// 用双线性插值而非最近邻取值：网格每格约几十像素，若只做最近邻，求梯度时若采样间距
+// 小于格宽，两次采样几乎总落在同一格里，梯度恒为 0，吸附力就永远不会触发——插值后
+// 掩膜值在格子之间连续变化，无论采样间距多小，梯度都是有意义的。
+function sampleMask(nx, ny){
+  if (!segReady) return null;
+  if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return 0;
+  const fx = Math.min(SEG_GRID_W - 1, Math.max(0, nx * SEG_GRID_W - 0.5));
+  const fy = Math.min(SEG_GRID_H - 1, Math.max(0, ny * SEG_GRID_H - 0.5));
+  const x0 = fx | 0, y0 = fy | 0;
+  const x1 = Math.min(SEG_GRID_W - 1, x0 + 1), y1 = Math.min(SEG_GRID_H - 1, y0 + 1);
+  const tx = fx - x0, ty = fy - y0;
+  const v00 = segGrid[y0*SEG_GRID_W + x0], v10 = segGrid[y0*SEG_GRID_W + x1];
+  const v01 = segGrid[y1*SEG_GRID_W + x0], v11 = segGrid[y1*SEG_GRID_W + x1];
+  const vx0 = v00 + (v10 - v00) * tx, vx1 = v01 + (v11 - v01) * tx;
+  return vx0 + (vx1 - vx0) * ty;
+}
 
 // 停在手上时，尾部持续冒出磷粉，很快消失（飞行时不再留拖尾）
 function emitTailPollen(b){
@@ -807,48 +888,185 @@ function updateParticles(){
   ctx.globalAlpha = 1;
 }
 
+// 大约一半的粉尘在生成时就被标记成“候选”，才有机会被身体轮廓接住；其余的不管怎么下坠
+// 都不会被接住，一直下坠到消失或飘出画面
+const ATTRACT_CHANCE = 0.5;
+
 // 挤压时喷出粉尘颗粒（像涂鸦笔留痕，但每一粒都会在空中漂浮后消失）
 // bsize：画笔蝴蝶的大小 -> 笔画粗细随之变化
-function spawnDust(x, y, t, strength, bsize){
-  const [h,s,l] = dustColor(t);
+// speed：手/蝴蝶这一帧移动的像素数（用于让粉尘随快慢变化）；suddenTurn：本帧是否方向突变
+function spawnDust(x, y, t, strength, bsize, speed, suddenTurn){
   const BRUSH_THICK = 1.6;   // 画笔整体加粗
   const BRUSH_DENSE = 1.2;   // 每次喷出的颗粒数（调稀疏）
-  const BRUSH_SPREAD = 1.9;  // 颗粒向外铺开的范围（更分散 -> 笔迹更粗更松）
+  const BRUSH_SPREAD = 1.0;  // 颗粒向外铺开的范围（调小 -> 笔迹更紧凑，不那么散）
   // 粗细系数：基准随蝴蝶缩小同步缩小 -> 不同大小仍有粗细差异；再乘整体加粗系数
   const nominal = 80 * BFLY_SHRINK;
   const f = Math.max(0.55, Math.min(1.8, (bsize || nominal) / nominal)) * BRUSH_THICK;
-  const n = Math.max(2, Math.round((3 + strength*4) * BRUSH_DENSE));
+
+  // 把手部速度（像素/帧）映射到 -1（慢）~ 0（常速）~ 1（快），驱动配色/大小/铺开/密度
+  const speedT = Math.max(-1, Math.min(1, ((speed||0) - 3) / 9));
+  const fastness = (speedT + 1) / 2;                // 0(慢)~1(快)，用于插值
+  const sizeMul    = 1.2  - fastness*0.55;          // 慢=颗粒更大更实，快=更小像被甩出的粉末
+  const spreadMul  = 0.55 + fastness*0.6;           // 快时铺得稍开，但整体收紧了不少
+  const velMul     = 0.6  + fastness*2.0;           // 快时初速更大，像被甩飞
+  const densityMul = 1.25 - fastness*0.35;          // 慢时更密集
+
+  const n = Math.max(2, Math.round((3 + strength*4) * BRUSH_DENSE * densityMul));
   for (let i = 0; i < n; i++){
-    const a = Math.random()*Math.PI*2, r = Math.random()*16*strength*f*BRUSH_SPREAD;   // 越大的蝴蝶笔画越宽
+    const a = Math.random()*Math.PI*2, r = Math.random()*10*strength*f*BRUSH_SPREAD*spreadMul;   // 越大的蝴蝶笔画越宽
+    const c = pickDustTint(t, speedT);
     dust.push({
       x: x + Math.cos(a)*r, y: y + Math.sin(a)*r,
-      vx: (Math.random()-0.5)*0.035,                // 初速很小，先保住画的形状
-      vy: (Math.random()-0.5)*0.035 - 0.012,
+      vx: (Math.random()-0.5)*0.035*velMul,          // 初速很小，先保住画的形状；快挥手时更大
+      vy: (Math.random()-0.5)*0.035*velMul - 0.012,
       ox: Math.cos(a), oy: Math.sin(a),             // 向外发散的方向
       life: 1, decay: 0.00045 + Math.random()*0.00045, // 更慢：约 22~37 秒后才消失
-      size: (0.9 + Math.random()*1.5) * f,              // 颗粒直径调小；仍随蝴蝶大小
-      h, s, l, ph: Math.random()*6.28, sw: 0.008 + Math.random()*0.018
+      size: (0.9 + Math.random()*1.5) * f * sizeMul,   // 颗粒直径调小；仍随蝴蝶大小与手速变化
+      h: c.h, s: c.s, l: c.l, glow: c.tier === 'spark',  // 高光/特殊色粒子额外发光渲染
+      alphaMul: 0.72 + Math.random()*0.28,            // 每颗透明度也随机，但下限抬高，避免颜色被冲淡发黑
+      ph: Math.random()*6.28, sw: 0.008 + Math.random()*0.018,
+      stuck: false,                                  // 是否已落定在身体轮廓上
+      attractable: Math.random() < ATTRACT_CHANCE     // 只有少数候选粒子才可能被身体轮廓接住
     });
+  }
+
+  // 方向突变（急转弯）：额外补几颗格外亮的高光粒子
+  if (suddenTurn){
+    const pal = paletteOf(t);
+    const [h0, s0, l0] = pal.spark;
+    const sparkN = 3 + (Math.random()*3|0);
+    for (let i = 0; i < sparkN; i++){
+      const a = Math.random()*Math.PI*2, r = Math.random()*10*f;
+      dust.push({
+        x: x + Math.cos(a)*r, y: y + Math.sin(a)*r,
+        vx: (Math.random()-0.5)*0.6, vy: (Math.random()-0.5)*0.6 - 0.2,
+        ox: Math.cos(a), oy: Math.sin(a),
+        life: 1, decay: 0.0009 + Math.random()*0.0006,     // 高光粒子消失得快一些
+        size: (1.3 + Math.random()*1.4) * f,
+        h: h0 + (Math.random()-0.5)*8, s: Math.min(100, s0+10), l: Math.min(98, l0+8),
+        glow: true, alphaMul: 0.85 + Math.random()*0.15,
+        ph: Math.random()*6.28, sw: 0.02 + Math.random()*0.02,
+        stuck: false, attractable: Math.random() < ATTRACT_CHANCE
+      });
+    }
+  }
+
+  if (dust.length > 7000) dust.splice(0, dust.length - 7000);
+}
+
+// 停手时“啪”一下：从深色中心 → 主色 → 浅色边缘（外沿再点缀几颗高光）炸开的一团 bloom
+function spawnBloom(x, y, t, bsize){
+  const pal = paletteOf(t);
+  const nominal = 80 * BFLY_SHRINK;
+  const f = Math.max(0.55, Math.min(1.8, (bsize || nominal) / nominal));
+  const rings = [
+    { tier:'deep',  n:6,  rMin:0,     rMax:6*f,  sizeMul:1.3,  spd:0.15, glow:true  },
+    { tier:'main',  n:14, rMin:5*f,   rMax:16*f, sizeMul:1.15, spd:0.35, glow:false },
+    { tier:'light', n:16, rMin:14*f,  rMax:28*f, sizeMul:0.95, spd:0.55, glow:false },
+    { tier:'spark', n:5,  rMin:24*f,  rMax:34*f, sizeMul:0.85, spd:0.75, glow:true  },
+  ];
+  for (const ring of rings){
+    const [h0, s0, l0] = pal[ring.tier];
+    for (let i = 0; i < ring.n; i++){
+      const a = Math.random()*Math.PI*2;
+      const r = ring.rMin + Math.random()*(ring.rMax - ring.rMin);
+      dust.push({
+        x: x + Math.cos(a)*r, y: y + Math.sin(a)*r,
+        vx: Math.cos(a)*ring.spd*(0.5+Math.random()), vy: Math.sin(a)*ring.spd*(0.5+Math.random()) - 0.03,
+        ox: Math.cos(a), oy: Math.sin(a),
+        life: 1, decay: 0.00035 + Math.random()*0.0004,
+        size: (1.1 + Math.random()*1.6) * f * ring.sizeMul,
+        h: h0 + (Math.random()-0.5)*8,
+        s: Math.max(0, Math.min(100, s0 + (Math.random()-0.5)*12)),
+        l: Math.max(4, Math.min(97, l0 + (Math.random()-0.5)*10)),
+        glow: ring.glow, alphaMul: 0.7 + Math.random()*0.3,
+        ph: Math.random()*6.28, sw: 0.01 + Math.random()*0.015,
+        stuck: false, attractable: Math.random() < ATTRACT_CHANCE
+      });
+    }
   }
   if (dust.length > 7000) dust.splice(0, dust.length - 7000);
 }
 
-// 粉尘：缓慢上浮、随气流轻摆，逐渐变淡直至消失
+// 粉尘吸附到身体轮廓所用的参数（脸/头顶也算在人体分割范围内，不用单独判断——
+// 落点纯粹由“重力方向 + 身体轮廓”决定：从上面落下的粉尘自然会先落在头顶、肩膀这类最高处，
+// 而不是画一圈固定光环；身体一移开，落点也会跟着脱离、重新交给重力）
+const STICK_ISO = 0.5;      // 分割掩膜的“人体/背景”等值线，即视为轮廓边缘
+const STICK_BAND = 0.025;   // 判定“压在轮廓线上”的宽度收窄了不少，看起来才像一条线而不是一整片
+const GRAVITY = 0.02;       // 重力加速度：每帧叠加到下坠速度上（调小了，落得更慢一点）
+const MAX_FALL_SPEED = 0.8; // 下坠速度上限，也跟着调小，避免飘久了的粒子还是落得太快
+const STICK_CATCH_CHANCE = 0.7;   // 候选粒子（attractable）下坠途中经过轮廓线时，被“接住”粘住的概率
+const REST_TOLERANCE = 3;   // 落定后判定“还稳稳贴着身体”的容差倍数（相对 STICK_BAND）——
+                             // 超出这个范围就说明身体已经移开，粒子会脱离、重新交给重力下坠
+
+// 粉尘：只有少数“可吸附”的粒子会被身体轮廓接住，其余大部分只是自由下坠、不会被接住；
+// 接住是纯被动的——粒子该怎么下坠就怎么下坠，只有下坠途中恰好穿过轮廓线时才会被接住定住，
+// 一旦支撑它的身体部位移开了，就会脱离、重新开始下坠（可能之后又落在别处，也可能落到画面外）
 function updateDust(){
   for (let i = dust.length - 1; i >= 0; i--){
     const p = dust[i];
     p.ph += p.sw;
-    // 持续向外的漂移 + 少量布朗扰动 -> 粉尘团随时间慢慢往外发散（速度很慢）
-    p.vx += p.ox * 0.0007 + (Math.random()-0.5) * 0.0035;
-    p.vy += p.oy * 0.0007 + (Math.random()-0.5) * 0.0035;
-    p.vx *= 0.985; p.vy *= 0.985;            // 阻尼，保持缓慢
-    p.x += p.vx + Math.cos(p.ph) * 0.06;    // 横向轻摆，像空气中的浮尘
-    p.y += p.vy - 0.005;                     // 轻微上浮
-    p.life -= p.decay;
+
+    // 接住检测：只对候选粒子（p.attractable）生效，且只在下坠途中恰好经过轮廓线的那一刻判定
+    if (segReady && p.attractable && !p.stuck){
+      const m0 = sampleMask(p.x / W, p.y / H);
+      if (m0 != null && Math.abs(m0 - STICK_ISO) < STICK_BAND && Math.random() < STICK_CATCH_CHANCE){
+        p.stuck = true;
+      }
+    }
+
+    // 已经落定的粒子：这是“躺在身上”的重力效果，不是磁吸——只要这个点还贴着身体表面就原地静止；
+    // 身体一旦移开、这个点不再贴着轮廓了，就脱离吸附，重新交给重力（不会瞬移去别处，就是掉下去）
+    if (segReady && p.stuck){
+      const m0 = sampleMask(p.x / W, p.y / H);
+      if (m0 == null || Math.abs(m0 - STICK_ISO) > STICK_BAND * REST_TOLERANCE){
+        p.stuck = false;                 // 支撑面移开了，脱离，恢复下坠
+      } else {
+        p.vx *= 0.6; p.vy *= 0.6;        // 还稳稳躺着：残余速度自然衰减，静止不动
+      }
+    }
+
+    if (p.stuck){
+      // 已落定：直接按上面算出的（趋近于 0 的）速度移动，只留极轻微的呼吸感
+      p.x += p.vx; p.y += p.vy + Math.cos(p.ph) * 0.01;
+    } else {
+      // 未吸附（含所有粒子，包括还没被“接住”的候选粒子）：真的会加速下坠的重力，而不是恒定小偏移；
+      // 水平方向仍然是原本的轻摆阻尼，垂直方向不再做阻尼，靠 MAX_FALL_SPEED 封顶
+      p.vx += p.ox * 0.0007 + (Math.random()-0.5) * 0.0035;
+      p.vx *= 0.985;                            // 水平阻尼，保持轻摆
+      p.vy += GRAVITY;                          // 持续加速下坠（真正的重力感）
+      if (p.vy > MAX_FALL_SPEED) p.vy = MAX_FALL_SPEED;
+      p.x += p.vx + Math.cos(p.ph) * 0.06;      // 横向轻摆，像空气中的浮尘
+      p.y += p.vy;
+    }
+
+    p.life -= p.decay * (p.stuck ? 0.2 : 1);   // 吸附后消退慢很多，更像颜料留在身上
     if (p.life <= 0){ dust.splice(i, 1); continue; }
-    ctx.globalAlpha = Math.min(1, p.life * 1.4) * 0.55;   // 尾段渐隐
-    ctx.fillStyle = `hsl(${p.h},${p.s}%,${p.l}%)`;
-    ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, 7); ctx.fill();
+
+    // 每颗粒子的透明度 = 生命衰减 × 吸附与否的基础值 × 生成时就定好的随机透明度。
+    // 基础值/随机范围都调高了：之前几个 <1 的系数连乘，非高光粒子常常只剩 0.3~0.5 的不透明度，
+    // 半透明的橙/金色叠在深色背景上会被“冲淡”成暗棕近黑，只有用叠加发光的高光粒子才显色——
+    // 现在把普通粒子的不透明度下限抬高，颜色本身才显得出来，同时仍保留一点随机变化
+    const baseAlpha = Math.min(1, p.life * 1.4) * (p.stuck ? 0.95 : 0.85) * p.alphaMul;
+    if (p.glow){
+      // 高光/特殊粒子（黑鳞、银闪、bloom 中心与外沿等）：径向渐变 + 叠加发光，避免平铺实心点
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      const R = p.size * 2.2;
+      const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, R);
+      g.addColorStop(0,   `hsla(${p.h},${p.s}%,${Math.min(97,p.l+14)}%,${baseAlpha})`);
+      g.addColorStop(0.5, `hsla(${p.h},${p.s}%,${p.l}%,${baseAlpha*0.55})`);
+      g.addColorStop(1,   `hsla(${p.h},${p.s}%,${p.l}%,0)`);
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(p.x, p.y, R, 0, 7); ctx.fill();
+      ctx.restore();
+    } else {
+      // 普通粒子：淡淡的外圈 + 略亮的内核，两层柔化，不再是硬边实心圆点
+      ctx.fillStyle = `hsla(${p.h},${p.s}%,${p.l}%,${baseAlpha*0.55})`;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.size*1.6, 0, 7); ctx.fill();
+      ctx.fillStyle = `hsla(${p.h},${p.s}%,${p.l}%,${baseAlpha})`;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.size*0.7, 0, 7); ctx.fill();
+    }
   }
   ctx.globalAlpha = 1;
 }
@@ -991,9 +1209,29 @@ function tick(){
     // 抓住 + 手掌张开 -> 显示名字弹窗
     updateLabel(b, b.onHand && b.openness > 0.7);
 
-    // 抓住 + 握拳挤压 -> 喷出粉尘，在空中漂浮成画
+    // 抓住 + 握拳挤压 -> 喷出粉尘，在空中漂浮成画；颜色/大小/铺开随手部快慢与转向变化
     if (b.onHand && b.openness < 0.4){
-      spawnDust(b.x, b.y, b.type, 1 - b.openness, b.size);   // 握得越紧喷得越多；越大笔画越粗
+      const speed = Math.hypot(b.vx, b.vy);       // 这一帧移动的像素数，当作手速的代理
+
+      // 方向突变（急转弯）-> 补几颗格外亮的高光粒子
+      let suddenTurn = false;
+      if (speed > 1.6){
+        const angle = Math.atan2(b.vy, b.vx);
+        if (b._prevAngle != null){
+          let da = Math.abs(angle - b._prevAngle);
+          if (da > Math.PI) da = Math.PI*2 - da;
+          if (da > 1.05) suddenTurn = true;        // 转向超过约 60°
+        }
+        b._prevAngle = angle;
+      }
+
+      // 从“移动”变为“停住” -> 啪一下炸开一团 bloom
+      const wasMoving = b._wasMoving;
+      const nowMoving = speed > 0.6;
+      if (wasMoving && !nowMoving) spawnBloom(b.x, b.y, b.type, b.size);
+      b._wasMoving = nowMoving;
+
+      spawnDust(b.x, b.y, b.type, 1 - b.openness, b.size, speed, suddenTurn);   // 握得越紧喷得越多；越大笔画越粗
     }
   }
 
@@ -1034,7 +1272,7 @@ function updateLabel(b, show){
 }
 
 /* ---------- 启动 ---------- */
-let hands, camera;
+let hands, camera, selfie;
 startBtn.addEventListener('click', async () => {
   errEl.textContent = '';
   startBtn.textContent = 'Starting…';
@@ -1051,8 +1289,25 @@ startBtn.addEventListener('click', async () => {
     });
     hands.onResults(onResults);
 
+    // 人体分割（用于粉尘吸附到身体轮廓）：是锦上添花的功能，加载失败也不影响手势/蝴蝶主体验
+    try {
+      if (typeof SelfieSegmentation !== 'undefined'){
+        selfie = new SelfieSegmentation({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${f}` });
+        selfie.setOptions({ modelSelection: 1 });   // 1 = landscape 模型，更快，适合摄像头画面
+        selfie.onResults(onSegResults);
+      } else {
+        console.warn('[body-outline] SelfieSegmentation library failed to load from CDN — dust will float freely instead of sticking to your outline.');
+      }
+    } catch (segErr){
+      console.warn('Selfie segmentation unavailable, dust will not stick to body outline:', segErr);
+      selfie = null;
+    }
+
     camera = new Camera(video, {
-      onFrame: async () => { await hands.send({ image: video }); },
+      onFrame: async () => {
+        await hands.send({ image: video });
+        if (selfie) await selfie.send({ image: video });
+      },
       width: 1280, height: 720
     });
     await camera.start();
